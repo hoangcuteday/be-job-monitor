@@ -1,20 +1,25 @@
 """Read-only HTTP API over the monitor's SQLite database.
 
-Runs as a second process against the same jobs.db the monitor writes to
-(WAL mode allows concurrent readers); it never writes. Same pattern as the
-`jobs status`/`jobs recent` CLI commands, which already run alongside the
-monitor.
+Self-contained (stdlib sqlite3 only, no dependency on the job_monitor
+package) so it can live in its own deploy repo/container, reading the same
+jobs.db the monitor writes to over a read-only bind mount.
 """
 
+import os
+import sqlite3
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 
-from job_monitor.config import Settings
-from job_monitor.database import Database
-from job_monitor.dates import parse_timestamp, stamp, utcnow
-from job_monitor.models import CHANNELS, FEEDS
+DATABASE_PATH = Path(os.environ.get("DATABASE_PATH", "/app/data/jobs.db"))
+FEEDS = {
+    "full-time": "full_time",
+    "internships": "internship",
+    "offseason-internships": "offseason_internship",
+}
 
-settings = Settings.from_env()
-db = Database(settings.database_path)
 app = FastAPI(
     title="Job Monitor API",
     description="Read-only queries over the monitor's job database, in the same shape "
@@ -22,39 +27,71 @@ app = FastAPI(
     version="1.0.0",
 )
 
+# Read-only, unauthenticated, no cookies involved — safe to expose to any origin
+# so the static frontend (served from S3/any domain) can call this API directly.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
+
+
+def query(sql: str, params: tuple = ()) -> list[dict]:
+    connection = sqlite3.connect(f"file:{DATABASE_PATH}?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        return [dict(row) for row in connection.execute(sql, params)]
+    finally:
+        connection.close()
+
 
 @app.get("/healthz", tags=["ops"], summary="Liveness check")
 async def healthz():
-    return {"ok": True, "now": stamp(utcnow())}
+    return {
+        "ok": True,
+        "now": datetime.now(timezone.utc).isoformat(timespec="microseconds"),
+    }
 
 
-@app.get("/status", tags=["ops"], summary="Monitor status (same as `jobs status --json`)")
-async def status():
-    # async: sqlite3 connections are thread-affine, and FastAPI runs sync `def`
-    # endpoints in a worker thread pool, not the thread that opened `db`.
-    return db.status(settings, utcnow())
-
-
-@app.get("/jobs/recent", tags=["jobs"], summary="Verified recent publications (same as `jobs recent --json`)")
+@app.get(
+    "/jobs/recent",
+    tags=["jobs"],
+    summary="Verified recent publications (same as `jobs recent --json`)",
+)
 async def jobs_recent(
     feed: str = Query("full-time", description=f"One of: {', '.join(FEEDS)}"),
-    hours: float = Query(24, gt=0, le=24, description="Rolling window in hours, (0, 24]"),
-    all: bool = Query(False, description="Include relevance-excluded jobs, not just matching ones"),
+    hours: float = Query(
+        24, gt=0, le=24, description="Rolling window in hours, (0, 24]"
+    ),
+    all: bool = Query(
+        False, description="Include relevance-excluded jobs, not just matching ones"
+    ),
 ):
-    """Active jobs whose authoritative original publication falls in the last `hours`."""
+    """Active jobs whose authoritative original publication falls in the last `hours`.
+
+    Every row here has publication_date_confidence='ORIGINAL' and published_at inside
+    the window by construction, so its classification is always "VERIFIED_RECENT".
+    """
     if feed not in FEEDS:
         raise HTTPException(400, f"Unknown feed; choose one of {list(FEEDS)}")
-    now = utcnow()
-    rows = db.recent(hours, now, not all, FEEDS[feed])
+    now = datetime.now(timezone.utc)
+    window_start = (now - timedelta(hours=hours)).isoformat(timespec="microseconds")
+    rows = query(
+        """SELECT j.*, c.last_successful_check FROM job_postings j JOIN companies c USING(company_key)
+           WHERE j.is_active=1 AND c.enabled=1 AND publication_date_confidence='ORIGINAL'
+           AND published_at>=? AND published_at<=? AND (?=0 OR included=1) AND j.audience=?
+           ORDER BY published_at DESC""",
+        (
+            window_start,
+            now.isoformat(timespec="microseconds"),
+            int(not all),
+            FEEDS[feed],
+        ),
+    )
     for row in rows:
-        row["posting_age_seconds"] = (now - parse_timestamp(row["published_at"])).total_seconds()
-        row["classification"] = Database.category(row, now)
+        row["posting_age_seconds"] = (
+            now - datetime.fromisoformat(row["published_at"])
+        ).total_seconds()
+        row["classification"] = "VERIFIED_RECENT"
     return rows
-
-
-@app.get("/jobs/open", tags=["jobs"], summary="Matching jobs not yet sent or queued to Discord")
-async def jobs_open(feed: str = Query("full-time", description=f"One of: {', '.join(CHANNELS)}")):
-    """Matching jobs on enabled boards this feed hasn't sent or queued yet, newest first."""
-    if feed not in CHANNELS:
-        raise HTTPException(400, f"Unknown feed; choose one of {list(CHANNELS)}")
-    return db.open_jobs(CHANNELS[feed])

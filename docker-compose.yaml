@@ -1,0 +1,11 @@
+services:
+  api:
+    build: .
+    image: job-monitor-be:latest
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_PATH: /app/data/jobs.db
+    volumes:
+      - /root/job-monitor/webhook/data:/app/data:ro
